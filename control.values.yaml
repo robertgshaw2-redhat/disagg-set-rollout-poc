@@ -1,0 +1,50 @@
+# CONTROL experiment: the same EPP over the same pods, minus the rollout screener.
+# Layered on top of router.values.yaml as a second release, so the real router
+# is not touched:
+#
+#   helm upgrade --install dsv2-noscreen \
+#     oci://ghcr.io/llm-d/charts/llm-d-router-standalone --version v0.10.0 \
+#     -n robshaw-dev -f router.values.yaml -f control.values.yaml
+#
+# With nothing pinning a request to a revision, the prefill and the decode
+# profile each pick from the whole pool, and pairs cross versions freely.
+router:
+  epp:
+    pluginsCustomConfig:
+      plugins.yaml: |
+        apiVersion: llm-d.ai/v1alpha1
+        kind: EndpointPickerConfig
+        plugins:
+          - type: disagg-headers-handler
+          - type: always-disagg-pd-decider
+          - type: disagg-profile-handler
+            parameters:
+              deciders:
+                prefill: always-disagg-pd-decider
+          - type: prefill-filter
+          - type: decode-filter
+          - type: inflight-load-producer
+          - type: token-load-scorer
+          - type: active-request-scorer
+          - type: max-score-picker
+        schedulingProfiles:
+        - name: prefill
+          plugins:
+          - pluginRef: prefill-filter
+          - pluginRef: token-load-scorer
+          - pluginRef: max-score-picker
+        - name: decode
+          plugins:
+          - pluginRef: decode-filter
+          - pluginRef: active-request-scorer
+          - pluginRef: max-score-picker
+  proxy:
+    configMap:
+      name: dsv2-noscreen-envoy
+    volumes:
+      - name: config
+        configMap:
+          name: dsv2-noscreen-envoy
+          items:
+            - key: envoy.yaml
+              path: envoy.yaml

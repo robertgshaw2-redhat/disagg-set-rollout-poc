@@ -1,0 +1,108 @@
+# EPP "v0" + Envoy in front of BOTH DisaggregatedSet versions.
+#
+#   helm upgrade --install dsv2 \
+#     oci://ghcr.io/llm-d/charts/llm-d-router-standalone --version v0.10.0 \
+#     -n robshaw-dev -f router.values.yaml
+#   kubectl port-forward -n robshaw-dev svc/dsv2-epp 8000:80
+#
+# One InferencePool selects every pod of every version by llm-d.ai/guide. What
+# keeps a request inside one version is the disaggregatedset-rollout-screener:
+# it runs once per request, ahead of both scheduling profiles, picks ONE
+# revision (weighted by Ready pods), and hides every other revision's endpoints
+# from the prefill and the decode profile alike. So p0 only ever pairs with d0
+# and p1 with d1, whatever the scorers would have preferred.
+router:
+  epp:
+    # Single replica: the revision decision and the in-flight load accounting
+    # are both local to the EPP process.
+    replicas: 1
+    image:
+      registry: ghcr.io/llm-d
+      repository: llm-d-router-endpoint-picker
+      tag: main@sha256:790c4f7d61b18d71947b353799bd5c69e309c096c192e55d3354779df9db0795
+      pullPolicy: IfNotPresent
+    flags:
+      ha-enable-leader-election: false
+      metrics-endpoint-auth: false
+      # disaggregatedset-rollout-screener is Alpha stability.
+      allow-experimental-plugins: true
+
+    env:
+      - name: HF_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: llm-d-hf-token
+            key: HF_TOKEN
+
+    pluginsConfigFile: "plugins.yaml"
+    pluginsCustomConfig:
+      plugins.yaml: |
+        apiVersion: llm-d.ai/v1alpha1
+        kind: EndpointPickerConfig
+        plugins:
+          - type: disaggregatedset-rollout-screener
+            parameters:
+              scope:
+                # NOT disaggregatedset.x-k8s.io/name: the two versions are two
+                # DisaggregatedSet objects, and the screener has to see both.
+                labelSelector: "llm-d.ai/guide=dsv2-rollout"
+              revisionGating:
+                # Traffic share per revision = its share of Ready pods of the
+                # globally most numerous role. 2P2D vs 1P1D => 67% / 33%.
+                mode: max-role
+                requiredRoles: [prefill, decode]
+                # One EPP, sequential P/D: nothing to coordinate across.
+                disableCoordination: true
+          - type: disagg-headers-handler
+          - type: always-disagg-pd-decider
+          - type: disagg-profile-handler
+            parameters:
+              deciders:
+                prefill: always-disagg-pd-decider
+          - type: prefill-filter
+          - type: decode-filter
+          - type: inflight-load-producer
+          - type: token-load-scorer
+          - type: active-request-scorer
+          - type: max-score-picker
+        schedulingProfiles:
+        - name: prefill
+          plugins:
+          - pluginRef: prefill-filter
+          - pluginRef: token-load-scorer
+          - pluginRef: max-score-picker
+        - name: decode
+          plugins:
+          - pluginRef: decode-filter
+          - pluginRef: active-request-scorer
+          - pluginRef: max-score-picker
+
+  # The chart names the Envoy bootstrap ConfigMap plain "envoy", so a second
+  # release in one namespace collides with the first (robshaw-dev already has
+  # the glm release). Give this release its own copy.
+  proxy:
+    configMap:
+      name: dsv2-envoy
+    volumes:
+      - name: config
+        configMap:
+          name: dsv2-envoy
+          items:
+            - key: envoy.yaml
+              path: envoy.yaml
+
+  extraServicePorts:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 8081
+
+  modelServers:
+    type: vllm
+    # One port per DP rank: vLLM ranks on prefill, the routing-proxy on decode.
+    # The EPP schedules over (pod, port), which is what makes it DP-aware.
+    targetPorts:
+      - number: 8000
+      - number: 8001
+    matchLabels:
+      llm-d.ai/guide: "dsv2-rollout"
